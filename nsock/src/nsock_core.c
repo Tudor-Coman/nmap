@@ -4,7 +4,7 @@
  *                                                                         *
  ***********************IMPORTANT NSOCK LICENSE TERMS***********************
  *                                                                         *
- * The nsock parallel socket event library is (C) 1999-2015 Insecure.Com   *
+ * The nsock parallel socket event library is (C) 1999-2016 Insecure.Com   *
  * LLC This library is free software; you may redistribute and/or          *
  * modify it under the terms of the GNU General Public License as          *
  * published by the Free Software Foundation; Version 2.  This guarantees  *
@@ -107,6 +107,70 @@ void update_first_events(struct nevent *nse);
  * cleared after the first is completed.
  * The socket_count_* functions return the event to transmit to update_events()
  */
+
+
+int get_overlapped(struct niod *iod, struct nevent *nse) {
+#if HAVE_IOCP
+  DWORD dwRes = 0;
+  BOOL bRet;
+  int err;
+
+  bRet = GetOverlappedResult((HANDLE)iod->sd, (LPOVERLAPPED)&nse->eov, &dwRes, FALSE);
+  if (!bRet) {
+    err = GetLastError();
+    assert (err == WSA_IO_PENDING);
+  }
+  return dwRes;
+#endif
+  return -1;
+}
+
+void call_read_overlapped(struct nevent *nse) {
+#if HAVE_IOCP
+  DWORD flags = 0;
+  int ret = 0;
+  struct sockaddr_storage peer;
+  socklen_t peerlen = 0;
+
+  nse->wsabuf.buf = nse->buf;
+  nse->wsabuf.len = sizeof(nse->wsabuf.buf);
+  nse->eov.ev = EV_READ;
+
+  ret = WSARecv(nse->iod->sd, &nse->wsabuf, 1, NULL, &flags,(LPOVERLAPPED)&nse->eov, NULL);
+  if (ret) {
+    ret = GetLastError();
+    assert (ret == WSA_IO_PENDING);
+  }
+#endif
+}
+
+void call_write_overlapped(struct nevent *nse) {
+#if HAVE_IOCP
+  int ret;
+  char *str;
+  int bytesleft;
+
+  str = fs_str(&nse->iobuf) + nse->writeinfo.written_so_far;
+  bytesleft = fs_length(&nse->iobuf) - nse->writeinfo.written_so_far;
+
+  nse->wsabuf.buf = str;
+  nse->wsabuf.len = bytesleft;
+  nse->eov.ev = EV_WRITE;
+
+  if (nse->writeinfo.dest.ss_family == AF_UNSPEC)
+    ret = WSASend(nse->iod->sd, &nse->wsabuf, 1, NULL, 0, (LPWSAOVERLAPPED)&nse->eov, NULL);
+  else
+    ret = WSASendTo(nse->iod->sd, &nse->wsabuf, 1, NULL, 0,
+    (struct sockaddr *)&nse->writeinfo.dest, (int)nse->writeinfo.destlen,
+    (LPWSAOVERLAPPED)&nse->eov, NULL);
+  if (ret) {
+    ret = GetLastError();
+    assert(ret == WSA_IO_PENDING);
+  }
+#endif
+}
+
+
 int socket_count_zero(struct niod *iod, struct npool *ms) {
   iod->readsd_count = 0;
   iod->writesd_count = 0;
@@ -241,6 +305,8 @@ static int iod_add_event(struct niod *iod, struct nevent *nse) {
       else
         gh_list_append(&nsp->read_events, &nse->nodeq_io);
       iod->first_read = &nse->nodeq_io;
+      if (!strcmp(nsp->engine->name, "iocp"))
+        call_read_overlapped(nse);
       break;
 
     case NSE_TYPE_WRITE:
@@ -249,6 +315,8 @@ static int iod_add_event(struct niod *iod, struct nevent *nse) {
       else
         gh_list_append(&nsp->write_events, &nse->nodeq_io);
       iod->first_write = &nse->nodeq_io;
+      if (!strcmp(nsp->engine->name, "iocp"))
+        call_write_overlapped(nse);
       break;
 
 #if HAVE_PCAP
@@ -489,9 +557,13 @@ void handle_connect_result(struct npool *ms, struct nevent *nse, enum nse_status
                                iod->peerlen, nsock_iod_get_peerport(iod));
         nsock_engine_iod_register(ms, iod, saved_ev);
 
-        SSL_clear(iod->ssl);
-        if(!SSL_clear(iod->ssl))
-           fatal("SSL_clear failed: %s", ERR_error_string(ERR_get_error(), NULL));
+        /* Use SSL_free here because SSL_clear keeps session info, which
+         * doesn't work when changing SSL versions (as we're clearly trying to
+         * do by adding SSL_OP_NO_SSLv2). */
+        SSL_free(iod->ssl);
+        iod->ssl = SSL_new(ms->sslctx);
+        if (!iod->ssl)
+          fatal("SSL_new failed: %s", ERR_error_string(ERR_get_error(), NULL));
 
         SSL_set_options(iod->ssl, options | SSL_OP_NO_SSLv2);
         socket_count_read_inc(nse->iod);
@@ -538,15 +610,21 @@ void handle_write_result(struct npool *ms, struct nevent *nse, enum nse_status s
       res = SSL_write(iod->ssl, str, bytesleft);
     else
 #endif
+    if (!strcmp(ms->engine->name, "iocp")) {
+      res = get_overlapped(iod, nse);
+    } else {
       if (nse->writeinfo.dest.ss_family == AF_UNSPEC)
         res = send(nse->iod->sd, str, bytesleft, 0);
       else
         res = sendto(nse->iod->sd, str, bytesleft, 0, (struct sockaddr *)&nse->writeinfo.dest, (int)nse->writeinfo.destlen);
+    }
     if (res == bytesleft) {
       nse->event_done = 1;
       nse->status = NSE_STATUS_SUCCESS;
     } else if (res >= 0) {
       nse->writeinfo.written_so_far += res;
+      if (!strcmp(ms->engine->name, "iocp"))
+        call_write_overlapped(nse);
     } else {
       assert(res == -1);
       if (iod->ssl) {
@@ -621,10 +699,16 @@ static int do_actual_read(struct npool *ms, struct nevent *nse) {
   if (!iod->ssl) {
     do {
       struct sockaddr_storage peer;
-      socklen_t peerlen;
+      socklen_t peerlen = sizeof(struct sockaddr);
 
       peerlen = sizeof(peer);
-      buflen = recvfrom(iod->sd, buf, sizeof(buf), 0, (struct sockaddr *)&peer, &peerlen);
+      if (!strcmp(ms->engine->name, "iocp")) {
+        buflen = get_overlapped(iod, nse);
+#if HAVE_IOCP
+        strncpy(buf, nse->buf, buflen);
+#endif
+      } else
+        buflen = recvfrom(iod->sd, buf, sizeof(buf), 0, (struct sockaddr *)&peer, &peerlen);
 
       /* Using recv() was failing, at least on UNIX, for non-network sockets
        * (i.e. stdin) in this case, a read() is done - as on ENOTSOCK we may
@@ -664,8 +748,9 @@ static int do_actual_read(struct npool *ms, struct nevent *nse) {
          * return only one datagram at a time. The consistency of the above
          * assignment of iod->peer depends on not consolidating more than one
          * UDP read buffer. */
-        if (buflen > 0 && buflen < sizeof(buf))
+        if (buflen > 0 && buflen < sizeof(buf)) {
           return fs_length(&nse->iobuf) - startlen;
+        }
       }
     } while (buflen > 0 || (buflen == -1 && err == EINTR));
 
@@ -1090,7 +1175,6 @@ void process_iod_events(struct npool *nsp, struct niod *nsi, int ev) {
 #endif
     NULL
   };
-
   assert(nsp == nsi->nsp);
   nsock_log_debug_all("Processing events on IOD %lu (ev=%d)", nsi->id, ev);
 
@@ -1128,8 +1212,8 @@ void process_iod_events(struct npool *nsp, struct niod *nsi, int ev) {
        * current IOD */
       if (nse->iod != nsi)
         break;
-
       process_event(nsp, evlists[i], nse, ev);
+
       next = gh_lnode_next(current);
 
       if (nse->event_done) {

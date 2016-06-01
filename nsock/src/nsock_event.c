@@ -7,7 +7,7 @@
  *                                                                         *
  ***********************IMPORTANT NSOCK LICENSE TERMS***********************
  *                                                                         *
- * The nsock parallel socket event library is (C) 1999-2015 Insecure.Com   *
+ * The nsock parallel socket event library is (C) 1999-2016 Insecure.Com   *
  * LLC This library is free software; you may redistribute and/or          *
  * modify it under the terms of the GNU General Public License as          *
  * published by the Free Software Foundation; Version 2.  This guarantees  *
@@ -473,6 +473,10 @@ struct nevent *event_new(struct npool *nsp, enum nse_type type,
   else
     nsock_log_debug("%s (IOD #%li) (EID #%li)", __func__, nse->iod->id,
                     nse->id);
+
+#if HAVE_IOCP
+  ZeroMemory(&nse->eov, sizeof(struct extended_overlapped));
+#endif
   return nse;
 }
 

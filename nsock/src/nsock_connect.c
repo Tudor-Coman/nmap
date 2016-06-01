@@ -3,7 +3,7 @@
  * connections from the nsock parallel socket event library                *
  ***********************IMPORTANT NSOCK LICENSE TERMS***********************
  *                                                                         *
- * The nsock parallel socket event library is (C) 1999-2015 Insecure.Com   *
+ * The nsock parallel socket event library is (C) 1999-2016 Insecure.Com   *
  * LLC This library is free software; you may redistribute and/or          *
  * modify it under the terms of the GNU General Public License as          *
  * published by the Free Software Foundation; Version 2.  This guarantees  *
@@ -53,6 +53,12 @@
  ***************************************************************************/
 
 /* $Id$ */
+
+#if WIN32
+#include "nsock_winconfig.h"
+#include <Winsock2.h>
+#include <Mswsock.h>
+#endif
 
 #include "nsock.h"
 #include "nsock_internal.h"
@@ -253,15 +259,49 @@ void nsock_connect_internal(struct npool *ms, struct nevent *nse, int type, int 
       memcpy(&iod->peer, ss, sslen);
     iod->peerlen = sslen;
 
-    if (connect(iod->sd, (struct sockaddr *)ss, sslen) == -1) {
-      int err = socket_errno();
+    if (strcmp(ms->engine->name, "iocp")) {
+      if (connect(iod->sd, (struct sockaddr *)ss, sslen) == -1) {
+        int err = socket_errno();
 
-      if (proto == IPPROTO_UDP || (err != EINPROGRESS && err != EAGAIN)) {
-        nse->event_done = 1;
-        nse->status = NSE_STATUS_ERROR;
-        nse->errnum = err;
+        if (proto == IPPROTO_UDP || (err != EINPROGRESS && err != EAGAIN)) {
+          nse->event_done = 1;
+          nse->status = NSE_STATUS_ERROR;
+          nse->errnum = err;
+        }
       }
     }
+#if HAVE_IOCP
+    else {
+      DWORD numBytes = 0;
+      GUID guid = WSAID_CONNECTEX;
+      LPFN_CONNECTEX ConnectExPtr = NULL;
+      int success = WSAIoctl(iod->sd, SIO_GET_EXTENSION_FUNCTION_POINTER,
+        (void*)&guid, sizeof(guid), (void*)&ConnectExPtr, sizeof(ConnectExPtr),
+        &numBytes, NULL, NULL);
+      SOCKET sock = iod->sd;
+
+      struct sockaddr_in addr;
+      ZeroMemory(&addr, sizeof(addr));
+      addr.sin_family = AF_INET;
+      addr.sin_addr.s_addr = INADDR_ANY;
+      addr.sin_port = 0;
+
+      DWORD rc = bind(sock, (SOCKADDR*)&addr, sizeof(addr));
+      if (rc != 0) {
+        printf("bind failed: %d\n", WSAGetLastError());
+      }
+      nse->eov.ev = EV_WRITE | EV_WRITE;
+      BOOL ok = ConnectExPtr(sock, (SOCKADDR*)ss, sslen, NULL, 0, NULL, (LPOVERLAPPED)&nse->eov);
+      if (!ok) {
+        int err = WSAGetLastError();
+        if (err != ERROR_IO_PENDING) {
+          nse->event_done = 1;
+          nse->status = NSE_STATUS_ERROR;
+          nse->errnum = err;
+        }
+      }
+    }
+#endif
     /* The callback handle_connect_result handles the connection once it completes. */
   }
 }

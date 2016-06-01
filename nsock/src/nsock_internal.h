@@ -5,7 +5,7 @@
  *                                                                         *
  ***********************IMPORTANT NSOCK LICENSE TERMS***********************
  *                                                                         *
- * The nsock parallel socket event library is (C) 1999-2015 Insecure.Com   *
+ * The nsock parallel socket event library is (C) 1999-2016 Insecure.Com   *
  * LLC This library is free software; you may redistribute and/or          *
  * modify it under the terms of the GNU General Public License as          *
  * published by the Free Software Foundation; Version 2.  This guarantees  *
@@ -135,6 +135,13 @@ enum iod_state {
 
 
 /* ------------------- STRUCTURES ------------------- */
+
+#if HAVE_IOCP
+struct extended_overlapped {
+  OVERLAPPED ov;
+  int ev;
+};
+#endif
 
 struct readinfo {
   enum nsock_read_types read_type;
@@ -350,6 +357,13 @@ struct nevent {
    * of an union to optimize memory footprint. */
   gh_lnode_t nodeq_io;
   gh_lnode_t nodeq_pcap;
+
+#if HAVE_IOCP
+  struct extended_overlapped eov;
+  WSABUF wsabuf;
+  char buf[8192];
+  int done;
+#endif
 
   /* Optional (NULL if unset) pointer to pass to the handler */
   void *userdata;

@@ -104,4 +104,8 @@
 #define HAVE_POLL 1
 #endif
 
+#if WIN32
+#define HAVE_IOCP 1
+#endif
+
 #endif /* NSOCK_WINCONFIG_H */
