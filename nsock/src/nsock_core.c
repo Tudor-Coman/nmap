@@ -97,7 +97,6 @@ struct timeval nsock_tod;
 void update_first_events(struct nevent *nse);
 
 
-
 /* Each iod has a count of pending socket reads, socket writes, and pcap reads.
  * When a descriptor's count is nonzero, its bit must be set in the appropriate
  * master fd_set, and when the count is zero the bit must be cleared. What we
@@ -107,6 +106,82 @@ void update_first_events(struct nevent *nse);
  * cleared after the first is completed.
  * The socket_count_* functions return the event to transmit to update_events()
  */
+
+static int errcode_is_failure(int err) {
+#ifndef WIN32
+  return err != EINTR && err != EAGAIN && err != EBUSY;
+#else
+  return err != EINTR && err != EAGAIN && err != WSA_IO_PENDING;
+#endif
+}
+
+int get_overlapped(struct niod *iod, struct nevent *nse) {
+#if HAVE_IOCP
+  DWORD dwRes = 0;
+  BOOL bRet;
+  int err;
+
+  bRet = GetOverlappedResult((HANDLE)iod->sd, (LPOVERLAPPED)&nse->eov, &dwRes, FALSE);
+  if (!bRet) {
+    err = GetLastError();
+  }
+
+  return dwRes;
+#endif
+  return -1;
+}
+
+void call_read_overlapped(struct nevent *nse) {
+#if HAVE_IOCP
+  DWORD flags = 0;
+  int err = 0;
+
+  nse->wsabuf.buf = nse->buf;
+  nse->wsabuf.len = 1024;
+
+  err = WSARecvFrom(nse->iod->sd, &nse->wsabuf, 1, NULL, &flags, 
+    (struct sockaddr *)&nse->iod->peer, (LPINT)&nse->iod->peerlen, (LPOVERLAPPED)&nse->eov, NULL);
+  if (err) {
+    err = socket_errno();
+    if (errcode_is_failure(err)) {
+      nse->event_done = 1;
+      nse->status = NSE_STATUS_ERROR;
+      nse->errnum = err;
+    }
+  }
+#endif
+}
+
+void call_write_overlapped(struct nevent *nse) {
+#if HAVE_IOCP
+  int err;
+  char *str;
+  int bytesleft;
+
+  str = fs_str(&nse->iobuf) + nse->writeinfo.written_so_far;
+  bytesleft = fs_length(&nse->iobuf) - nse->writeinfo.written_so_far;
+
+  nse->wsabuf.buf = str;
+  nse->wsabuf.len = bytesleft;
+
+  if (nse->writeinfo.dest.ss_family == AF_UNSPEC)
+    err = WSASend(nse->iod->sd, &nse->wsabuf, 1, NULL, 0, (LPWSAOVERLAPPED)&nse->eov, NULL);
+  else
+    err = WSASendTo(nse->iod->sd, &nse->wsabuf, 1, NULL, 0,
+    (struct sockaddr *)&nse->writeinfo.dest, (int)nse->writeinfo.destlen,
+    (LPWSAOVERLAPPED)&nse->eov, NULL);
+  if (err) {
+    err = socket_errno();
+    if (errcode_is_failure(err)) {
+      nse->event_done = 1;
+      nse->status = NSE_STATUS_ERROR;
+      nse->errnum = err;
+    }
+  }
+#endif
+}
+
+
 int socket_count_zero(struct niod *iod, struct npool *ms) {
   iod->readsd_count = 0;
   iod->writesd_count = 0;
@@ -241,6 +316,11 @@ static int iod_add_event(struct niod *iod, struct nevent *nse) {
       else
         gh_list_append(&nsp->read_events, &nse->nodeq_io);
       iod->first_read = &nse->nodeq_io;
+      if (!strcmp(nsp->engine->name, "iocp")) {
+        //process_iod_events(nsp, iod, nse->eov.ev);
+        call_read_overlapped(nse);
+        
+      }
       break;
 
     case NSE_TYPE_WRITE:
@@ -249,6 +329,10 @@ static int iod_add_event(struct niod *iod, struct nevent *nse) {
       else
         gh_list_append(&nsp->write_events, &nse->nodeq_io);
       iod->first_write = &nse->nodeq_io;
+      if (!strcmp(nsp->engine->name, "iocp")) {
+        struct iocp_engine_info *iinfo = (struct iocp_engine_info *)nsp->engine_data;
+        PostQueuedCompletionStatus(*(HANDLE *)iinfo, 0, (ULONG_PTR)iod, (LPOVERLAPPED)&nse->eov);
+      }
       break;
 
 #if HAVE_PCAP
@@ -514,14 +598,6 @@ void handle_connect_result(struct npool *ms, struct nevent *nse, enum nse_status
 #endif
 }
 
-static int errcode_is_failure(int err) {
-#ifndef WIN32
-  return err != EINTR && err != EAGAIN && err != EBUSY;
-#else
-  return err != EINTR && err != EAGAIN;
-#endif
-}
-
 void handle_write_result(struct npool *ms, struct nevent *nse, enum nse_status status) {
   int bytesleft;
   char *str;
@@ -542,15 +618,21 @@ void handle_write_result(struct npool *ms, struct nevent *nse, enum nse_status s
       res = SSL_write(iod->ssl, str, bytesleft);
     else
 #endif
+    if (!strcmp(ms->engine->name, "iocp")) {
+      res = get_overlapped(iod, nse);
+    } else {
       if (nse->writeinfo.dest.ss_family == AF_UNSPEC)
         res = send(nse->iod->sd, str, bytesleft, 0);
       else
         res = sendto(nse->iod->sd, str, bytesleft, 0, (struct sockaddr *)&nse->writeinfo.dest, (int)nse->writeinfo.destlen);
+    }
     if (res == bytesleft) {
       nse->event_done = 1;
       nse->status = NSE_STATUS_SUCCESS;
     } else if (res >= 0) {
       nse->writeinfo.written_so_far += res;
+      if (!strcmp(ms->engine->name, "iocp"))
+        call_write_overlapped(nse);
     } else {
       assert(res == -1);
       if (iod->ssl) {
@@ -625,10 +707,17 @@ static int do_actual_read(struct npool *ms, struct nevent *nse) {
   if (!iod->ssl) {
     do {
       struct sockaddr_storage peer;
-      socklen_t peerlen;
+      socklen_t peerlen = sizeof(struct sockaddr);
 
       peerlen = sizeof(peer);
-      buflen = recvfrom(iod->sd, buf, sizeof(buf), 0, (struct sockaddr *)&peer, &peerlen);
+      if (!strcmp(ms->engine->name, "iocp")) {
+        buflen = get_overlapped(iod, nse);
+        peerlen = 0;
+#if HAVE_IOCP
+        memcpy(buf, nse->buf, buflen);
+#endif
+      } else
+        buflen = recvfrom(iod->sd, buf, sizeof(buf), 0, (struct sockaddr *)&peer, &peerlen);
 
       /* Using recv() was failing, at least on UNIX, for non-network sockets
        * (i.e. stdin) in this case, a read() is done - as on ENOTSOCK we may
@@ -644,11 +733,7 @@ static int do_actual_read(struct npool *ms, struct nevent *nse) {
         err = socket_errno();
         break;
       }
-      /* Windows will ignore src_addr and addrlen arguments to recvfrom on TCP
-       * sockets, so peerlen is still sizeof(peer) and peer is junk. Instead,
-       * only set this if it's not already set.
-       */
-      if (peerlen > 0 && iod->peerlen == 0) {
+      if (peerlen > 0) {
         assert(peerlen <= sizeof(iod->peer));
         memcpy(&iod->peer, &peer, peerlen);
         iod->peerlen = peerlen;
@@ -672,8 +757,9 @@ static int do_actual_read(struct npool *ms, struct nevent *nse) {
          * return only one datagram at a time. The consistency of the above
          * assignment of iod->peer depends on not consolidating more than one
          * UDP read buffer. */
-        if (buflen > 0 && buflen < sizeof(buf))
+        if (buflen > 0 && buflen < sizeof(buf)) {
           return fs_length(&nse->iobuf) - startlen;
+        }
       }
     } while (buflen > 0 || (buflen == -1 && err == EINTR));
 
@@ -1003,9 +1089,9 @@ void process_event(struct npool *nsp, gh_list_t *evlist, struct nevent *nse, int
           if (!nse->iod->ssl && match_w)
             handle_write_result(nsp, nse, NSE_STATUS_SUCCESS);
 
-        if (event_timedout(nse))
-          handle_write_result(nsp, nse, NSE_STATUS_TIMEOUT);
-        break;
+          if (event_timedout(nse))
+            handle_write_result(nsp, nse, NSE_STATUS_TIMEOUT);
+          break;
 
       case NSE_TYPE_TIMER:
         if (event_timedout(nse))
@@ -1070,7 +1156,6 @@ void process_event(struct npool *nsp, gh_list_t *evlist, struct nevent *nse, int
       assert(nse->iod->ssl != NULL);
 
     nsock_log_debug_all("NSE #%lu: Sending event", nse->id);
-
     /* WooHoo!  The event is ready to be sent */
     event_dispatch_and_delete(nsp, nse, 1);
   }
@@ -1098,7 +1183,6 @@ void process_iod_events(struct npool *nsp, struct niod *nsi, int ev) {
 #endif
     NULL
   };
-
   assert(nsp == nsi->nsp);
   nsock_log_debug_all("Processing events on IOD %lu (ev=%d)", nsi->id, ev);
 
@@ -1136,8 +1220,8 @@ void process_iod_events(struct npool *nsp, struct niod *nsi, int ev) {
        * current IOD */
       if (nse->iod != nsi)
         break;
-
       process_event(nsp, evlists[i], nse, ev);
+      
       next = gh_lnode_next(current);
 
       if (nse->event_done) {
@@ -1333,7 +1417,7 @@ void nsock_pool_add_event(struct npool *nsp, struct nevent *nse) {
 
   /* It can happen that the event already completed. In which case we can
    * already deliver it, even though we're probably not inside nsock_loop(). */
-  if (nse->event_done) {
+  if (nse->event_done && nse->type != NSE_TYPE_WRITE) {
     event_dispatch_and_delete(nsp, nse, 1);
     update_first_events(nse);
     nevent_unref(nsp, nse);

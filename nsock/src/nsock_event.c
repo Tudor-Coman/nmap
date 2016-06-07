@@ -473,6 +473,16 @@ struct nevent *event_new(struct npool *nsp, enum nse_type type,
   else
     nsock_log_debug("%s (IOD #%li) (EID #%li)", __func__, nse->iod->id,
                     nse->id);
+
+#if HAVE_IOCP
+  ZeroMemory(&nse->eov, sizeof(struct extended_overlapped));
+  if (type == NSE_TYPE_CONNECT || type == NSE_TYPE_CONNECT_SSL)
+    nse->eov.ev = EV_READ | EV_WRITE;
+  if (type == NSE_TYPE_WRITE)
+    nse->eov.ev = EV_WRITE;
+  if (type == NSE_TYPE_READ)
+    nse->eov.ev = EV_READ;
+#endif
   return nse;
 }
 

@@ -136,6 +136,13 @@ enum iod_state {
 
 /* ------------------- STRUCTURES ------------------- */
 
+#if HAVE_IOCP
+struct extended_overlapped {
+  OVERLAPPED ov;
+  int ev;
+};
+#endif
+
 struct readinfo {
   enum nsock_read_types read_type;
   /* num lines; num bytes; whatever (depends on read_type) */
@@ -350,6 +357,13 @@ struct nevent {
    * of an union to optimize memory footprint. */
   gh_lnode_t nodeq_io;
   gh_lnode_t nodeq_pcap;
+
+#if HAVE_IOCP
+  struct extended_overlapped eov;
+  WSABUF wsabuf;
+  char buf[1024];
+  int done;
+#endif
 
   /* Optional (NULL if unset) pointer to pass to the handler */
   void *userdata;
