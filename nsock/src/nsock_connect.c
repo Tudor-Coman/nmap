@@ -54,6 +54,12 @@
 
 /* $Id$ */
 
+#if WIN32
+#include "nsock_winconfig.h"
+#include <Winsock2.h>
+#include <Mswsock.h>
+#endif
+
 #include "nsock.h"
 #include "nsock_internal.h"
 #include "nsock_log.h"
@@ -252,16 +258,75 @@ void nsock_connect_internal(struct npool *ms, struct nevent *nse, int type, int 
     if (&iod->peer != ss)
       memcpy(&iod->peer, ss, sslen);
     iod->peerlen = sslen;
-
-    if (connect(iod->sd, (struct sockaddr *)ss, sslen) == -1) {
-      int err = socket_errno();
-
-      if (proto == IPPROTO_UDP || (err != EINPROGRESS && err != EAGAIN)) {
-        nse->event_done = 1;
-        nse->status = NSE_STATUS_ERROR;
-        nse->errnum = err;
+    if (nse->type == NSE_TYPE_CONNECT_SSL)
+      return;
+    if (strcmp(ms->engine->name, "iocp")) {
+      if (connect(iod->sd, (struct sockaddr *)ss, sslen) == -1) {
+        int err = socket_errno();
+        if (proto == IPPROTO_UDP || (err != EINPROGRESS && err != EAGAIN)) {
+          nse->event_done = 1;
+          nse->status = NSE_STATUS_ERROR;
+          nse->errnum = err;
+        }
+      } else {
+        int optval;
+        socklen_t optlen = sizeof(int);
+        if (getsockopt(iod->sd, SOL_SOCKET, SO_ERROR, (char *)&optval, &optlen) != 0) {
+          optval = socket_errno(); /* Stupid Solaris */
+          nse->status = NSE_STATUS_ERROR;
+          nse->errnum = optval;
+        } else {
+          nse->event_done = 1;
+          nse->status = NSE_STATUS_SUCCESS;
+        }
       }
     }
+#if HAVE_IOCP
+    else {
+      if (type == SOCK_DGRAM) {
+        if (connect(iod->sd, (struct sockaddr *)ss, sslen) == -1) {
+          int err = socket_errno();
+          if (proto == IPPROTO_UDP || (err != EINPROGRESS && err != EAGAIN)) {
+            nse->event_done = 1;
+            nse->status = NSE_STATUS_ERROR;
+            nse->errnum = err;
+          }
+        } else {
+          nse->event_done = 1;
+          nse->status = NSE_STATUS_SUCCESS;
+        }
+        return;
+      }
+      DWORD numBytes = 0;
+      GUID guid = WSAID_CONNECTEX;
+      LPFN_CONNECTEX ConnectExPtr = NULL;
+      int success = WSAIoctl(iod->sd, SIO_GET_EXTENSION_FUNCTION_POINTER,
+        (void*)&guid, sizeof(guid), (void*)&ConnectExPtr, sizeof(ConnectExPtr),
+        &numBytes, NULL, NULL);
+      SOCKET sock = iod->sd;
+
+      struct sockaddr_in addr;
+      ZeroMemory(&addr, sizeof(addr));
+      addr.sin_family = AF_INET;
+      addr.sin_addr.s_addr = INADDR_ANY;
+      addr.sin_port = 0;
+
+      DWORD rc = bind(sock, (SOCKADDR*)&addr, sizeof(addr));
+
+      nse->eov->ev = EV_WRITE | EV_WRITE;
+      BOOL ok = ConnectExPtr(sock, (SOCKADDR*)ss, sslen, NULL, 0, NULL, (LPOVERLAPPED)nse->eov);
+      if (!ok) {
+        int err = WSAGetLastError();
+        if (err != ERROR_IO_PENDING) {
+          nse->event_done = 1;
+          nse->status = NSE_STATUS_ERROR;
+          nse->errnum = err;
+        }
+      }
+      if (!nse->event_done)
+        nse->eov->done = 0;
+    }
+#endif
     /* The callback handle_connect_result handles the connection once it completes. */
   }
 }

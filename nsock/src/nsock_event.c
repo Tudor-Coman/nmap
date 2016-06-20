@@ -264,6 +264,7 @@ int nsock_event_cancel(nsock_pool ms_pool, nsock_event_id id, int notify) {
  * cancelled */
 int nevent_delete(struct npool *nsp, struct nevent *nse, gh_list_t *event_list,
                    gh_lnode_t *elem, int notify) {
+
   if (nse->event_done) {
     /* This event has already been marked for death somewhere else -- it will be
      * gone soon (and if we try to kill it now all hell will break loose due to
@@ -273,7 +274,7 @@ int nevent_delete(struct npool *nsp, struct nevent *nse, gh_list_t *event_list,
 
   nsock_log_info("%s on event #%li (type %s)", __func__, nse->id,
                  nse_type2str(nse->type));
-
+  
   /* Now that we found the event... we go through the motions of cleanly
    * cancelling it */
   switch (nse->type) {
@@ -473,6 +474,29 @@ struct nevent *event_new(struct npool *nsp, enum nse_type type,
   else
     nsock_log_debug("%s (IOD #%li) (EID #%li)", __func__, nse->iod->id,
                     nse->id);
+
+#if HAVE_IOCP
+  nse->eov = (struct extended_overlapped *)safe_malloc(sizeof(struct extended_overlapped));
+  ZeroMemory(nse->eov, sizeof(struct extended_overlapped));
+
+  if (type == NSE_TYPE_CONNECT || type == NSE_TYPE_CONNECT_SSL)
+    nse->eov->ev = EV_READ | EV_WRITE;
+
+  if (type == NSE_TYPE_WRITE)
+    nse->eov->ev = EV_WRITE;
+
+  if (type == NSE_TYPE_READ)
+    nse->eov->ev = EV_READ;
+
+  nse->eov->nse = nse;
+  nse->eov->done = 1;
+
+  if (type == NSE_TYPE_READ) {
+    nse->eov->wsabuf.buf = (char *)safe_malloc(1024 * sizeof(char));
+    nse->eov->wsabuf.len = 1024;
+  }
+#endif
+
   return nse;
 }
 
@@ -481,6 +505,20 @@ struct nevent *event_new(struct npool *nsp, enum nse_type type,
  * has ALREADY been decremented (done during event_dispatch_and_delete) -- so
  * remember to do this if you call event_delete() directly */
 void event_delete(struct npool *nsp, struct nevent *nse) {
+#if HAVE_IOCP
+  /* If an operation is in progress, we can't free the overlapped structure yet
+   * we cancel the operation, wait for the completion packet to resurface in the
+   * main loop and free the resources there */
+  if (!nse->eov->done) {
+    CancelIoEx((HANDLE)nse->iod->sd, (LPOVERLAPPED)nse->eov);
+    nse->eov->nse = NULL;
+  } else {
+    if (nse->eov->ev == EV_READ)
+      free(nse->eov->wsabuf.buf);
+    free(nse->eov);
+  }
+#endif
+
   if (nse->iod == NULL)
     nsock_log_debug("%s (IOD #NULL) (EID #%li)", __func__, nse->id);
   else
@@ -490,6 +528,8 @@ void event_delete(struct npool *nsp, struct nevent *nse) {
   if (nse->type == NSE_TYPE_READ || nse->type ==  NSE_TYPE_WRITE) {
     fs_free(&nse->iobuf);
   }
+
+
   #if HAVE_PCAP
   if (nse->type == NSE_TYPE_PCAP_READ) {
     fs_free(&nse->iobuf);
